@@ -1,0 +1,113 @@
+name: Build amba APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build amba APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-
+
+      - name: Generate mipmap icons
+        run: |
+          pip install Pillow -q
+          python3 gen_icon.py icon.jpg
+
+      - name: Install Gradle & regenerate wrapper
+        run: |
+          GRADLE_VERSION="8.4"
+          wget -q "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp/gradle-dist
+          GRADLE_BIN="/tmp/gradle-dist/gradle-${GRADLE_VERSION}/bin/gradle"
+          chmod +x "$GRADLE_BIN"
+          "$GRADLE_BIN" wrapper --gradle-version "$GRADLE_VERSION" --distribution-type bin
+          chmod +x gradlew
+
+      - name: Build amba APK
+        run: ./gradlew assembleRelease
+
+      - name: Setup keystore
+        run: |
+          # Cek apakah KEYSTORE_BASE64 secret tersedia
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+            echo "KEYSTORE_PATH=release.keystore" >> $GITHUB_ENV
+            echo "KEYSTORE_ALIAS=${{ secrets.KEY_ALIAS }}" >> $GITHUB_ENV
+            echo "KEYSTORE_PASS=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
+            echo "KEY_PASS=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
+            echo "USE_RELEASE_KEY=true" >> $GITHUB_ENV
+          else
+            # Fallback: generate keystore statis (hash tetap sama tiap build)
+            keytool -genkeypair \
+              -alias google \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 36500 \
+              -keystore release.keystore \
+              -storepass google123 \
+              -keypass google123 \
+              -dname "CN=GoogleTech,O=Ryuichi,C=ID"
+            echo "KEYSTORE_PATH=release.keystore" >> $GITHUB_ENV
+            echo "KEYSTORE_ALIAS=google" >> $GITHUB_ENV
+            echo "KEYSTORE_PASS=google123" >> $GITHUB_ENV
+            echo "KEY_PASS=google123" >> $GITHUB_ENV
+            echo "USE_RELEASE_KEY=false" >> $GITHUB_ENV
+          fi
+
+      - name: Sign APK with V1 + V2 + V3
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
+          echo "Found APK: $APK_PATH"
+
+          # Install build-tools apksigner
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" | sort -V | tail -1)
+          echo "Using apksigner: $APKSIGNER"
+
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE_PATH" \
+            --ks-key-alias "$KEYSTORE_ALIAS" \
+            --ks-pass pass:"$KEYSTORE_PASS" \
+            --key-pass pass:"$KEY_PASS" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out "amba.apk" \
+            "$APK_PATH"
+
+          echo "APK signed with V1+V2+V3 (release key: $USE_RELEASE_KEY)"
+
+      - name: Verify signature
+        run: |
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" | sort -V | tail -1)
+          "$APKSIGNER" verify --verbose --print-certs "amba.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amba
+          path: "amba.apk"
+          retention-days: 30
